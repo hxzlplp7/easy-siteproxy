@@ -463,19 +463,39 @@ normalize_token_prefix() {
 configure_siteproxy() {
   mkdir -p "$SITEPROXY_DIR"
 
-  printf "请输入代理域名（必须 https，例如 https://your-proxy.domain）: "
-  read -r proxy_url || proxy_url=""
-  if [ -z "$proxy_url" ]; then
-    warn "proxy_url 为空，使用示例值（请稍后修改）。"
-    proxy_url="https://your-proxy.domain.name"
-  fi
-  case "$proxy_url" in
-    https://*) : ;;
+  printf "\n${CYAN}配置 SiteProxy${NC}\n"
+  printf "────────────────────\n"
+  printf "请选择你的部署场景：\n"
+  printf "  ${YELLOW}1)${NC} 公网 VPS - 我已有域名，80/443 端口可用\n"
+  printf "  ${YELLOW}2)${NC} NAT VPS - 稍后通过菜单 12 配置 Argo 隧道\n"
+  printf "请选择 [1-2]（默认 1）: "
+  read -r deploy_mode || deploy_mode="1"
+
+  case "$deploy_mode" in
+    2)
+      # NAT 模式：使用占位值，稍后通过菜单 12 更新
+      proxy_url="https://placeholder.example.com"
+      printf "\n${YELLOW}提示：已设置占位 proxy_url，请在安装完成后执行菜单 12 配置 Argo 隧道${NC}\n"
+      printf "${YELLOW}      届时 proxy_url 会自动更新为实际的隧道地址${NC}\n\n"
+      ;;
     *)
-      warn "根据项目说明，proxy_url 应为 https:// 开头。已自动补全 https://"
-      proxy_url="https://${proxy_url#http://}"
+      # 公网模式：正常输入域名
+      printf "请输入代理域名（必须 https，例如 https://your-proxy.domain）: "
+      read -r proxy_url || proxy_url=""
+      if [ -z "$proxy_url" ]; then
+        warn "proxy_url 为空，使用示例值（请稍后通过菜单 8 修改）。"
+        proxy_url="https://your-proxy.domain.name"
+      fi
+      case "$proxy_url" in
+        https://*) : ;;
+        *)
+          warn "根据项目说明，proxy_url 应为 https:// 开头。已自动补全 https://"
+          proxy_url="https://${proxy_url#http://}"
+          ;;
+      esac
       ;;
   esac
+  
   # 去除末尾斜杠，避免与 token_prefix 拼接时出现双斜杠
   proxy_url="${proxy_url%/}"
 
@@ -483,7 +503,7 @@ configure_siteproxy() {
   read -r token_in || token_in=""
   token_prefix="$(normalize_token_prefix "$token_in")"
 
-  printf "请输入本地监听端口（默认 %s）: " "$DEFAULT_PORT"
+  printf "请输入本地监听端口（默认 %s，不要改成 80/443）: " "$DEFAULT_PORT"
   read -r port_in || port_in=""
   if [ -z "$port_in" ]; then
     local_port="$DEFAULT_PORT"
@@ -518,11 +538,16 @@ EOF
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
   info "配置已写入：${CONFIG_FILE}"
-  # 根据是否有密码显示不同的访问示例
-  if [ -n "$token_prefix" ]; then
-    info "访问形式示例：${proxy_url}${token_prefix}https://www.google.com"
+  
+  if [ "$deploy_mode" = "2" ]; then
+    printf "\n${YELLOW}下一步：安装完成后请执行菜单 12 配置公网入口${NC}\n"
   else
-    info "访问形式示例：${proxy_url}/https://www.google.com"
+    # 根据是否有密码显示不同的访问示例
+    if [ -n "$token_prefix" ]; then
+      info "访问形式示例：${proxy_url}${token_prefix}https://www.google.com"
+    else
+      info "访问形式示例：${proxy_url}/https://www.google.com"
+    fi
   fi
 }
 
