@@ -1437,6 +1437,104 @@ EOF
   info "现在可以通过 https://${domain} 访问（Cloudflare 自动提供 SSL）"
 }
 
+# 随机隧道（trycloudflare）- 无需账号，临时测试用
+setup_quick_tunnel() {
+  port="$1"
+  
+  install_cloudflared || return 1
+
+  info "启动随机隧道（trycloudflare）模式..."
+  printf "\n${YELLOW}注意：随机隧道每次重启后 URL 会变化，仅适合临时测试！${NC}\n"
+  printf "${YELLOW}生产环境请使用固定隧道（需要 Cloudflare 账号和域名）${NC}\n\n"
+
+  # 启动隧道并捕获 URL
+  info "正在启动隧道..."
+  
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    # 创建 systemd 服务运行随机隧道
+    cat <<EOF | as_root tee /etc/systemd/system/cloudflared-quick.service >/dev/null
+[Unit]
+Description=Cloudflare Quick Tunnel (trycloudflare)
+After=network.target siteproxy.service
+
+[Service]
+Type=simple
+User=$(id -un)
+ExecStart=$(command -v cloudflared) tunnel --url http://localhost:${port}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    as_root systemctl daemon-reload
+    as_root systemctl enable --now cloudflared-quick || true
+    
+    info "cloudflared-quick 服务已启动"
+    info "等待隧道 URL 生成..."
+    sleep 5
+    
+    # 从日志获取 URL
+    tunnel_url="$(journalctl -u cloudflared-quick --no-pager -n 50 2>/dev/null | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n 1 || true)"
+    
+    if [ -n "$tunnel_url" ]; then
+      printf "\n${GREEN}===========================================\n"
+      printf "          随机隧道已启动！\n"
+      printf "===========================================${NC}\n"
+      printf "\n${CYAN}隧道 URL：${NC}${tunnel_url}\n"
+      printf "\n${YELLOW}注意：此 URL 在服务重启后会变化${NC}\n"
+      
+      # 更新 config.json
+      if [ -f "$CONFIG_FILE" ]; then
+        tmpf="${CONFIG_FILE}.tmp"
+        sed "s|\"proxy_url\":.*|\"proxy_url\": \"${tunnel_url}\",|" "$CONFIG_FILE" > "$tmpf"
+        mv -f "$tmpf" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        info "已更新 config.json 中的 proxy_url"
+        restart_service
+      fi
+      
+      # 显示完整访问示例
+      token_prefix="$(awk -F'"' '/token_prefix/{print $4}' "$CONFIG_FILE" 2>/dev/null || true)"
+      if [ -n "$token_prefix" ] && [ "$token_prefix" != "" ]; then
+        printf "\n${CYAN}访问示例：${NC}${tunnel_url}${token_prefix}https://www.google.com\n"
+      else
+        printf "\n${CYAN}访问示例：${NC}${tunnel_url}/https://www.google.com\n"
+      fi
+    else
+      warn "未能自动获取隧道 URL，请手动查看日志："
+      printf "  journalctl -u cloudflared-quick -f\n"
+    fi
+  else
+    # 非 systemd：前台运行并手动获取 URL
+    info "在后台启动隧道..."
+    nohup cloudflared tunnel --url "http://localhost:${port}" > "${SITEPROXY_DIR}/cloudflared.log" 2>&1 &
+    cf_pid=$!
+    echo "$cf_pid" > "${SITEPROXY_DIR}/cloudflared.pid"
+    
+    sleep 5
+    tunnel_url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "${SITEPROXY_DIR}/cloudflared.log" 2>/dev/null | head -n 1 || true)"
+    
+    if [ -n "$tunnel_url" ]; then
+      printf "\n${GREEN}隧道 URL：${NC}${tunnel_url}\n"
+      printf "${YELLOW}注意：此 URL 在进程重启后会变化${NC}\n"
+      
+      # 更新 config.json
+      if [ -f "$CONFIG_FILE" ]; then
+        tmpf="${CONFIG_FILE}.tmp"
+        sed "s|\"proxy_url\":.*|\"proxy_url\": \"${tunnel_url}\",|" "$CONFIG_FILE" > "$tmpf"
+        mv -f "$tmpf" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        restart_service
+      fi
+    else
+      warn "未能获取隧道 URL，请查看日志：${SITEPROXY_DIR}/cloudflared.log"
+    fi
+  fi
+}
+
 setup_public_entry_wizard() {
   ensure_bundle_present || return 1
 
@@ -1446,18 +1544,19 @@ setup_public_entry_wizard() {
   printf "          公网入口配置向导\n"
   printf "===========================================${NC}\n"
   
-  domain="$(read_domain_input)" || return 1
-  
   printf "\n请选择你的 VPS 类型：\n"
   printf "  ${YELLOW}1)${NC} 公网 VPS（有独立公网 IP，80/443 端口可入站）\n"
   printf "     └─ 使用 Nginx + Certbot 自动签发 HTTPS 证书\n"
-  printf "  ${YELLOW}2)${NC} NAT VPS / 无公网入站（80/443 不可用）\n"
-  printf "     └─ 使用 Cloudflare Tunnel（Argo）无需开放端口\n"
-  printf "\n请选择 [1-2]: "
+  printf "  ${YELLOW}2)${NC} NAT VPS - 固定隧道（推荐/生产环境）\n"
+  printf "     └─ 需要 Cloudflare 账号 + 域名，URL 永久固定\n"
+  printf "  ${YELLOW}3)${NC} NAT VPS - 随机隧道（临时测试）\n"
+  printf "     └─ 无需账号，URL 随机且重启会变\n"
+  printf "\n请选择 [1-3]: "
   read -r mode || mode="1"
 
   case "$mode" in
     1)
+      domain="$(read_domain_input)" || return 1
       install_nginx_and_certbot || return 1
       write_nginx_siteproxy_conf "$domain" "$port" || return 1
       issue_cert_with_certbot "$domain" || return 1
@@ -1475,6 +1574,7 @@ setup_public_entry_wizard() {
       info "公网入口配置完成：Nginx + HTTPS"
       ;;
     2)
+      domain="$(read_domain_input)" || return 1
       setup_cloudflare_tunnel "$port" "$domain" || return 1
       
       # 更新 config.json 中的 proxy_url
@@ -1487,7 +1587,11 @@ setup_public_entry_wizard() {
         restart_service
       fi
       
-      info "NAT 入口配置完成：Cloudflare Tunnel"
+      info "NAT 入口配置完成：固定 Cloudflare Tunnel"
+      ;;
+    3)
+      setup_quick_tunnel "$port" || return 1
+      info "NAT 入口配置完成：随机 Cloudflare Tunnel（trycloudflare）"
       ;;
     *)
       warn "无效选项"
