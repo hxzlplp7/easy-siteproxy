@@ -1095,6 +1095,408 @@ print_port_status() {
 }
 
 # =========================
+# 公网入口向导
+# =========================
+read_listen_port() {
+  p="$(awk -F: '/local_listen_port/ {gsub(/[^0-9]/,"",$2); print $2}' "$CONFIG_FILE" 2>/dev/null | head -n 1 || true)"
+  [ -n "$p" ] || p="$DEFAULT_PORT"
+  printf "%s" "$p"
+}
+
+read_domain_input() {
+  printf "请输入你的域名（例如 example.com）: "
+  read -r d || d=""
+  d="${d#http://}"
+  d="${d#https://}"
+  d="${d%/}"
+  if [ -z "$d" ]; then
+    error "域名不能为空"
+    return 1
+  fi
+  printf "%s" "$d"
+}
+
+install_nginx_and_certbot() {
+  info "安装 Nginx + Certbot（公网 HTTPS 模式）"
+  case "$PKG_MGR" in
+    apt)
+      pkg_install nginx certbot python3-certbot-nginx
+      ;;
+    dnf)
+      pkg_install nginx certbot python3-certbot-nginx || true
+      ;;
+    yum)
+      # CentOS 7 可能需要 EPEL
+      as_root yum install -y epel-release 2>/dev/null || true
+      pkg_install nginx certbot python3-certbot-nginx || pkg_install nginx certbot certbot-nginx || true
+      ;;
+    apk)
+      pkg_install nginx certbot certbot-nginx || true
+      ;;
+    pkg)
+      pkg_install nginx py39-certbot py39-certbot-nginx || pkg_install nginx py-certbot py-certbot-nginx || true
+      ;;
+    *)
+      warn "未知包管理器，请手动安装 Nginx 和 Certbot"
+      return 1
+      ;;
+  esac
+
+  # 启动 Nginx
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    as_root systemctl enable --now nginx || true
+  elif [ "$INIT_SYSTEM" = "openrc" ]; then
+    as_root rc-update add nginx default || true
+    as_root rc-service nginx start || true
+  elif [ "$OS_FAMILY" = "freebsd" ]; then
+    as_root sysrc nginx_enable="YES" 2>/dev/null || true
+    as_root service nginx start || true
+  fi
+  
+  info "Nginx 安装完成"
+}
+
+write_nginx_siteproxy_conf() {
+  domain="$1"
+  port="$2"
+
+  info "写入 Nginx 反向代理配置..."
+
+  # 兼容常见发行版路径
+  if [ "$OS_FAMILY" = "debian" ]; then
+    conf="/etc/nginx/sites-available/siteproxy.conf"
+    enable_dir="/etc/nginx/sites-enabled"
+    cat <<EOF | as_root tee "$conf" >/dev/null
+server {
+    listen 80;
+    server_name ${domain};
+
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+    as_root mkdir -p "$enable_dir"
+    as_root ln -sf "$conf" "${enable_dir}/siteproxy.conf"
+    as_root rm -f "${enable_dir}/default" 2>/dev/null || true
+  elif [ "$OS_FAMILY" = "alpine" ]; then
+    conf="/etc/nginx/http.d/siteproxy.conf"
+    cat <<EOF | as_root tee "$conf" >/dev/null
+server {
+    listen 80;
+    server_name ${domain};
+    
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+  else
+    # RHEL/FreeBSD 等使用 conf.d
+    conf="/etc/nginx/conf.d/siteproxy.conf"
+    cat <<EOF | as_root tee "$conf" >/dev/null
+server {
+    listen 80;
+    server_name ${domain};
+
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+  fi
+
+  # 测试并重载
+  if as_root nginx -t; then
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+      as_root systemctl reload nginx
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+      as_root rc-service nginx reload || as_root rc-service nginx restart
+    elif [ "$OS_FAMILY" = "freebsd" ]; then
+      as_root service nginx reload || as_root service nginx restart
+    fi
+    info "Nginx 配置已写入并重载"
+  else
+    error "Nginx 配置测试失败，请检查配置"
+    return 1
+  fi
+}
+
+issue_cert_with_certbot() {
+  domain="$1"
+  
+  printf "请输入 Let's Encrypt 通知邮箱（用于证书到期提醒）: "
+  read -r email || email=""
+
+  printf "\n${YELLOW}注意：HTTP-01 验证需要 80 端口公网可达！${NC}\n"
+  printf "${YELLOW}如果你是 NAT VPS，80 端口不可达，签发会失败。${NC}\n"
+  printf "确认继续？[y/N]: "
+  read -r confirm || confirm="n"
+  case "$confirm" in
+    [Yy]*) : ;;
+    *) warn "已取消"; return 1 ;;
+  esac
+
+  info "正在签发 SSL 证书..."
+  
+  if [ -n "$email" ]; then
+    as_root certbot --nginx -d "$domain" --redirect --agree-tos -m "$email" --non-interactive || {
+      error "证书签发失败。可能原因：80 端口公网不可达、域名未解析到本机、防火墙阻挡"
+      return 1
+    }
+  else
+    as_root certbot --nginx -d "$domain" --redirect --agree-tos --register-unsafely-without-email --non-interactive || {
+      error "证书签发失败"
+      return 1
+    }
+  fi
+
+  info "证书签发完成！现在可以通过 https://${domain} 访问"
+}
+
+install_cloudflared() {
+  info "安装 cloudflared..."
+  
+  case "$PKG_MGR" in
+    apt)
+      # Debian/Ubuntu 使用 Cloudflare 官方仓库
+      if ! have_cmd cloudflared; then
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | as_root tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs 2>/dev/null || echo stable) main" | as_root tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+        as_root apt-get update -y
+        as_root apt-get install -y cloudflared
+      fi
+      ;;
+    dnf|yum)
+      if ! have_cmd cloudflared; then
+        # 使用官方 RPM
+        as_root curl -fsSL https://pkg.cloudflare.com/cloudflared-ascii.repo -o /etc/yum.repos.d/cloudflared.repo 2>/dev/null || true
+        as_root dnf install -y cloudflared 2>/dev/null || as_root yum install -y cloudflared 2>/dev/null || {
+          # 备用：直接下载二进制
+          warn "从官方仓库安装失败，尝试下载二进制..."
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64|amd64) arch="amd64" ;;
+            aarch64|arm64) arch="arm64" ;;
+            *) arch="amd64" ;;
+          esac
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" -o /tmp/cloudflared
+          as_root install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          rm -f /tmp/cloudflared
+        }
+      fi
+      ;;
+    apk)
+      # Alpine：下载二进制
+      if ! have_cmd cloudflared; then
+        arch="$(uname -m)"
+        case "$arch" in
+          x86_64|amd64) arch="amd64" ;;
+          aarch64|arm64) arch="arm64" ;;
+          *) arch="amd64" ;;
+        esac
+        curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" -o /tmp/cloudflared
+        as_root install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+        rm -f /tmp/cloudflared
+      fi
+      ;;
+    pkg)
+      # FreeBSD
+      if ! have_cmd cloudflared; then
+        as_root pkg install -y cloudflared 2>/dev/null || {
+          warn "FreeBSD pkg 安装失败，请手动安装 cloudflared"
+          return 1
+        }
+      fi
+      ;;
+    *)
+      if ! have_cmd cloudflared; then
+        warn "请手动安装 cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+        return 1
+      fi
+      ;;
+  esac
+  
+  if have_cmd cloudflared; then
+    info "cloudflared 安装完成：$(cloudflared --version 2>/dev/null | head -n 1)"
+  else
+    error "cloudflared 安装失败"
+    return 1
+  fi
+}
+
+setup_cloudflare_tunnel() {
+  port="$1"
+  domain="$2"
+
+  install_cloudflared || return 1
+
+  info "Cloudflare Tunnel（Argo）模式配置"
+  printf "\n${YELLOW}接下来需要登录 Cloudflare 账号授权（会打开浏览器或显示 URL）${NC}\n"
+  printf "按回车继续..."
+  read -r _ || true
+
+  cloudflared tunnel login || {
+    error "Cloudflare 登录失败。请确保能访问显示的 URL 并完成授权"
+    return 1
+  }
+
+  printf "请输入 tunnel 名称（默认 siteproxy）: "
+  read -r tname || tname=""
+  [ -n "$tname" ] || tname="siteproxy"
+
+  # 检查是否已存在
+  if cloudflared tunnel list 2>/dev/null | grep -q "$tname"; then
+    warn "Tunnel '$tname' 已存在，将使用现有 tunnel"
+  else
+    cloudflared tunnel create "$tname" || {
+      error "创建 tunnel 失败"
+      return 1
+    }
+  fi
+
+  # 绑定 DNS
+  info "绑定域名 ${domain} 到 tunnel..."
+  cloudflared tunnel route dns "$tname" "$domain" || {
+    warn "DNS 绑定可能失败，请到 Cloudflare 控制台手动添加 CNAME 记录"
+  }
+
+  # 获取 tunnel UUID
+  tid="$(cloudflared tunnel list 2>/dev/null | awk -v n="$tname" '$2 == n {print $1; exit}')"
+  if [ -z "$tid" ]; then
+    warn "未能自动获取 tunnel UUID，请手动编辑 config.yml"
+    tid="YOUR_TUNNEL_ID"
+  fi
+
+  # 写 config.yml
+  mkdir -p "${HOME}/.cloudflared"
+  cat > "${HOME}/.cloudflared/config.yml" <<EOF
+tunnel: ${tid}
+credentials-file: ${HOME}/.cloudflared/${tid}.json
+
+ingress:
+  - hostname: ${domain}
+    service: http://localhost:${port}
+  - service: http_status:404
+EOF
+
+  info "config.yml 已生成：${HOME}/.cloudflared/config.yml"
+
+  # 创建 systemd 服务（如果支持）
+  if [ "$INIT_SYSTEM" = "systemd" ]; then
+    info "创建 cloudflared systemd 服务..."
+    cloudflared service install 2>/dev/null || {
+      # 手动创建
+      cat <<EOF | as_root tee /etc/systemd/system/cloudflared.service >/dev/null
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+
+[Service]
+Type=simple
+User=$(id -un)
+ExecStart=$(command -v cloudflared) tunnel --config ${HOME}/.cloudflared/config.yml run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      as_root systemctl daemon-reload
+    }
+    as_root systemctl enable --now cloudflared || true
+    info "cloudflared 服务已启动"
+  else
+    # 其他系统：手动启动
+    info "请手动启动 cloudflared："
+    printf "  cloudflared tunnel --config ~/.cloudflared/config.yml run\n"
+  fi
+
+  info "Cloudflare Tunnel 配置完成！"
+  info "现在可以通过 https://${domain} 访问（Cloudflare 自动提供 SSL）"
+}
+
+setup_public_entry_wizard() {
+  ensure_bundle_present || return 1
+
+  port="$(read_listen_port)"
+  
+  printf "\n${CYAN}===========================================\n"
+  printf "          公网入口配置向导\n"
+  printf "===========================================${NC}\n"
+  
+  domain="$(read_domain_input)" || return 1
+  
+  printf "\n请选择你的 VPS 类型：\n"
+  printf "  ${YELLOW}1)${NC} 公网 VPS（有独立公网 IP，80/443 端口可入站）\n"
+  printf "     └─ 使用 Nginx + Certbot 自动签发 HTTPS 证书\n"
+  printf "  ${YELLOW}2)${NC} NAT VPS / 无公网入站（80/443 不可用）\n"
+  printf "     └─ 使用 Cloudflare Tunnel（Argo）无需开放端口\n"
+  printf "\n请选择 [1-2]: "
+  read -r mode || mode="1"
+
+  case "$mode" in
+    1)
+      install_nginx_and_certbot || return 1
+      write_nginx_siteproxy_conf "$domain" "$port" || return 1
+      issue_cert_with_certbot "$domain" || return 1
+      
+      # 更新 config.json 中的 proxy_url
+      if [ -f "$CONFIG_FILE" ]; then
+        tmpf="${CONFIG_FILE}.tmp"
+        sed "s|\"proxy_url\":.*|\"proxy_url\": \"https://${domain}\",|" "$CONFIG_FILE" > "$tmpf"
+        mv -f "$tmpf" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        info "已更新 config.json 中的 proxy_url 为 https://${domain}"
+        restart_service
+      fi
+      
+      info "公网入口配置完成：Nginx + HTTPS"
+      ;;
+    2)
+      setup_cloudflare_tunnel "$port" "$domain" || return 1
+      
+      # 更新 config.json 中的 proxy_url
+      if [ -f "$CONFIG_FILE" ]; then
+        tmpf="${CONFIG_FILE}.tmp"
+        sed "s|\"proxy_url\":.*|\"proxy_url\": \"https://${domain}\",|" "$CONFIG_FILE" > "$tmpf"
+        mv -f "$tmpf" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        info "已更新 config.json 中的 proxy_url 为 https://${domain}"
+        restart_service
+      fi
+      
+      info "NAT 入口配置完成：Cloudflare Tunnel"
+      ;;
+    *)
+      warn "无效选项"
+      return 1
+      ;;
+  esac
+}
+
+# =========================
 # 安装流程
 # =========================
 install_all() {
@@ -1164,6 +1566,7 @@ show_menu() {
   printf "${CYAN}║${NC}  ${YELLOW}9.${NC} 反向代理模板 (Nginx/Caddy)                  ${CYAN}║${NC}\n"
   printf "${CYAN}║${NC}  ${YELLOW}10.${NC} HTTPS 证书配置指南                         ${CYAN}║${NC}\n"
   printf "${CYAN}║${NC}  ${YELLOW}11.${NC} 端口状态检测                               ${CYAN}║${NC}\n"
+  printf "${CYAN}║${NC}  ${YELLOW}12.${NC} 一键配置公网入口 (HTTPS/Argo)              ${CYAN}║${NC}\n"
   printf "${CYAN}╠═══════════════════════════════════════════════════╣${NC}\n"
   printf "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                        ${CYAN}║${NC}\n"
   printf "${CYAN}╚═══════════════════════════════════════════════════╝${NC}\n"
@@ -1176,7 +1579,7 @@ menu() {
 
   while true; do
     show_menu
-    printf "请选择 [0-11]: "
+    printf "请选择 [0-12]: "
     read -r choice || choice="0"
 
     case "$choice" in
@@ -1191,11 +1594,12 @@ menu() {
       9) print_reverse_proxy_templates ;;
       10) print_https_guide ;;
       11) print_port_status ;;
+      12) setup_public_entry_wizard ;;
       0) 
         info "再见！"
         exit 0 
         ;;
-      *) warn "无效选项，请输入 0-11" ;;
+      *) warn "无效选项，请输入 0-12" ;;
     esac
   done
 }
